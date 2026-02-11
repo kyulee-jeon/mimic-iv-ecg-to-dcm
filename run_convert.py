@@ -9,6 +9,9 @@ Features:
 - df_info indexed by study_id for speed
 - checkpoint writes
 
+Input CSV: study_id, path (path is relative to wfdb_dir; wfdb_dir + path = WFDB base path)
+Output CSV: study_id, path, dcm_path (, dcm_error). dcm_path = dcm_dir + path with .dcm.
+
 Usage (Windows example):
 python run_convert.py ^
   --input_csv "C:\Projects\ecg_data\mimic-iv-ecg\study_ids.csv" ^
@@ -17,6 +20,7 @@ python run_convert.py ^
   --df_info_pkl "C:\Projects\ecg_data\mimic-iv-ecg\sample\machine_measurements_info.pkl" ^
   --output_csv "C:\Projects\ecg_data\mimic-iv-ecg\study_ids.with_dcm.csv" ^
   --study_id_col "study_id" ^
+  --path_col "path" ^
   --workers 12 ^
   --timeout 60 ^
   --checkpoint 2000
@@ -145,30 +149,49 @@ def _convert_target(q: mp.Queue, study_id: str, wfdb_path_no_ext: str, dcm_path:
         q.put((study_id, None, f"{type(e).__name__}: {e}"))
 
 
-def _convert_one_with_timeout(study_id: str, task_timeout_sec: int) -> dict:
+def _wfdb_path_no_ext(wfdb_dir: str, path: str) -> str:
+    """path (with or without .hea/.dat) -> full path without extension for rdrecord."""
+    p = path.strip()
+    for ext in (".hea", ".dat", ".dcm"):
+        if p.endswith(ext):
+            p = p[: -len(ext)]
+            break
+    return os.path.join(wfdb_dir, p)
+
+
+def _convert_one_with_timeout(study_id: str, path: str, task_timeout_sec: int) -> dict:
     """
     Worker entry:
-    - Resolve paths
+    - Resolve paths from (wfdb_dir + path), (dcm_dir + path → .dcm)
     - Fast skip if already good
-    - Look up df_info row
+    - Look up df_info row by study_id
     - Run hard-timeout conversion (child process)
     """
     global _G
 
     sid = _normalize_study_id(study_id)
-    wfdb_path_no_ext = os.path.join(_G["wfdb_dir"], sid)
-    dcm_path = os.path.join(_G["dcm_dir"], f"{sid}.dcm")
+    wfdb_path_no_ext = _wfdb_path_no_ext(_G["wfdb_dir"], path)
+    # dcm_path: dcm_dir + path with .dcm extension (path may be e.g. "subdir/sid" or "sid")
+    path_base = path.strip()
+    for ext in (".hea", ".dat", ".dcm"):
+        if path_base.endswith(ext):
+            path_base = path_base[: -len(ext)]
+            break
+    dcm_path = os.path.join(_G["dcm_dir"], path_base + ".dcm")
 
     # overwrite=False and already exists & valid => success (skip)
     if (not _G["overwrite"]) and Path(dcm_path).exists():
         ok, _ = validate_dicom_ecg_quick(dcm_path)
         if ok:
-            return {"study_id": sid, "dcm_path": dcm_path, "dcm_error": None}
+            return {"study_id": sid, "path": path, "dcm_path": dcm_path, "dcm_error": None}
+
+    # ensure output parent dir exists (dcm_path may be dcm_dir/subdir/sid.dcm)
+    Path(dcm_path).parent.mkdir(parents=True, exist_ok=True)
 
     # df_info row lookup (O(1))
     df_info_idx = _G["df_info_idx"]
     if sid not in df_info_idx.index:
-        return {"study_id": sid, "dcm_path": None, "dcm_error": "Missing df_info row for study_id"}
+        return {"study_id": sid, "path": path, "dcm_path": None, "dcm_error": "Missing df_info row for study_id"}
 
     row_dict = df_info_idx.loc[sid].to_dict()
 
@@ -185,14 +208,14 @@ def _convert_one_with_timeout(study_id: str, task_timeout_sec: int) -> dict:
     if p.is_alive():
         p.terminate()
         p.join(timeout=5)
-        return {"study_id": sid, "dcm_path": None, "dcm_error": f"Timeout>{task_timeout_sec}s"}
+        return {"study_id": sid, "path": path, "dcm_path": None, "dcm_error": f"Timeout>{task_timeout_sec}s"}
 
     # Collect result
     if not q.empty():
         sid2, out_path, err = q.get()
-        return {"study_id": sid2, "dcm_path": out_path, "dcm_error": err}
+        return {"study_id": sid2, "path": path, "dcm_path": out_path, "dcm_error": err}
 
-    return {"study_id": sid, "dcm_path": None, "dcm_error": "No result returned (unexpected)"}
+    return {"study_id": sid, "path": path, "dcm_path": None, "dcm_error": "No result returned (unexpected)"}
 
 
 # ============================================================
@@ -221,6 +244,7 @@ def run_batch(
     dcm_dir: str,
     df_info_pkl: str,
     study_id_col: str,
+    path_col: str,
     dcm_path_col: str,
     error_col: str,
     workers: int,
@@ -239,6 +263,8 @@ def run_batch(
 
     if study_id_col not in df.columns:
         raise KeyError(f"'{study_id_col}' column not found in CSV")
+    if path_col not in df.columns:
+        raise KeyError(f"'{path_col}' column not found in CSV (input must have study_id and path)")
 
     if dcm_path_col not in df.columns:
         df[dcm_path_col] = pd.NA
@@ -247,12 +273,15 @@ def run_batch(
 
     # Determine what to process: only not-success
     mask_success = df.apply(lambda r: _row_is_success(r, dcm_path_col), axis=1)
-    todo_ids = df.loc[~mask_success, study_id_col].tolist()
+    todo_list = [
+        (row[study_id_col], row[path_col])
+        for _, row in df.loc[~mask_success].iterrows()
+    ]
 
     with open(error_log, "a", encoding="utf-8") as f:
-        f.write(f"\n=== RUN {pd.Timestamp.now()} | todo={len(todo_ids)} ===\n")
+        f.write(f"\n=== RUN {pd.Timestamp.now()} | todo={len(todo_list)} ===\n")
 
-    if len(todo_ids) == 0:
+    if len(todo_list) == 0:
         print("All rows already successful. Nothing to do.")
         df.to_csv(output_csv, index=False)
         return
@@ -266,55 +295,71 @@ def run_batch(
         initializer=_init_worker,
         initargs=(df_info_pkl, wfdb_dir, dcm_dir, overwrite),
     ) as ex:
-        futs = {ex.submit(_convert_one_with_timeout, sid, task_timeout_sec): sid for sid in todo_ids}
+        futs = {
+            ex.submit(_convert_one_with_timeout, sid, path, task_timeout_sec): (sid, path)
+            for sid, path in todo_list
+        }
 
         for fut in tqdm(as_completed(futs), total=len(futs), desc="Converting"):
-            sid = futs[fut]
+            sid, path = futs[fut]
             try:
                 res = fut.result()
             except Exception as e:
-                res = {"study_id": _normalize_study_id(sid), "dcm_path": None, "dcm_error": f"WorkerCrash: {type(e).__name__}: {e}"}
+                res = {
+                    "study_id": _normalize_study_id(sid),
+                    "path": path,
+                    "dcm_path": None,
+                    "dcm_error": f"WorkerCrash: {type(e).__name__}: {e}",
+                }
 
             results_buffer.append(res)
             done += 1
 
             if checkpoint_every > 0 and (done % checkpoint_every == 0):
-                _apply_results(df, results_buffer, study_id_col, dcm_path_col, error_col, error_log)
+                _apply_results(df, results_buffer, study_id_col, path_col, dcm_path_col, error_col, error_log)
                 results_buffer.clear()
                 df.to_csv(output_csv, index=False)
 
     # final flush
     if results_buffer:
-        _apply_results(df, results_buffer, study_id_col, dcm_path_col, error_col, error_log)
+        _apply_results(df, results_buffer, study_id_col, path_col, dcm_path_col, error_col, error_log)
         results_buffer.clear()
 
     df.to_csv(output_csv, index=False)
 
 
-def _apply_results(df: pd.DataFrame, results: list[dict], study_id_col: str, dcm_path_col: str, error_col: str, error_log: str):
+def _apply_results(
+    df: pd.DataFrame,
+    results: list[dict],
+    study_id_col: str,
+    path_col: str,
+    dcm_path_col: str,
+    error_col: str,
+    error_log: str,
+):
     if not results:
         return
     r = pd.DataFrame(results)
-    r["_sid_norm"] = r["study_id"].map(_normalize_study_id)
+    r["_key"] = r["study_id"].map(_normalize_study_id) + "\t" + r["path"].astype(str)
 
-    df["_sid_norm"] = df[study_id_col].astype(str).map(_normalize_study_id)
+    df["_key"] = df[study_id_col].astype(str).map(_normalize_study_id) + "\t" + df[path_col].astype(str)
 
-    r = r.set_index("_sid_norm")
+    r = r.set_index("_key")
 
-    # Update rows
-    for i, sid_norm in enumerate(df["_sid_norm"].tolist()):
-        if sid_norm in r.index:
-            df.at[df.index[i], dcm_path_col] = r.at[sid_norm, "dcm_path"]
-            df.at[df.index[i], error_col] = r.at[sid_norm, "dcm_error"]
+    # Update rows by (study_id, path) key
+    for i, key in enumerate(df["_key"].tolist()):
+        if key in r.index:
+            df.at[df.index[i], dcm_path_col] = r.at[key, "dcm_path"]
+            df.at[df.index[i], error_col] = r.at[key, "dcm_error"]
 
     # Log errors
     err = r[r["dcm_error"].notna() & (r["dcm_error"].astype(str) != "None")]
     if not err.empty:
         with open(error_log, "a", encoding="utf-8") as f:
-            for sid_norm, row in err.iterrows():
-                f.write(f"{row['study_id']}\t{row['dcm_error']}\n")
+            for key, row in err.iterrows():
+                f.write(f"{row['study_id']}\t{row['path']}\t{row['dcm_error']}\n")
 
-    df.drop(columns=["_sid_norm"], inplace=True, errors="ignore")
+    df.drop(columns=["_key"], inplace=True, errors="ignore")
 
 
 # ============================================================
@@ -329,6 +374,7 @@ def parse_args():
     ap.add_argument("--df_info_pkl", required=True)
 
     ap.add_argument("--study_id_col", default="study_id")
+    ap.add_argument("--path_col", default="path", help="Column in input CSV: path relative to wfdb_dir")
     ap.add_argument("--dcm_path_col", default="dcm_path")
     ap.add_argument("--error_col", default="dcm_error")
 
@@ -355,6 +401,7 @@ def main():
         dcm_dir=args.dcm_dir,
         df_info_pkl=args.df_info_pkl,
         study_id_col=args.study_id_col,
+        path_col=args.path_col,
         dcm_path_col=args.dcm_path_col,
         error_col=args.error_col,
         workers=args.workers,
