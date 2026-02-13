@@ -6,8 +6,10 @@ This document describes how ECG waveform data and associated metadata from **MIM
 wfdb_to_dicom_ecg_phase1(
     sample_path_no_ext: str,
     out_dcm_path: str,
-    df_info: pd.DataFrame
-)
+    df_info: pd.DataFrame,
+    study_uid: Optional[str] = None,
+    series_uid: Optional[str] = None,
+) -> str
 ```
 
 The goal of *Phase 1* is to generate a **standards-compliant DICOM ECG waveform object** using:
@@ -16,6 +18,10 @@ The goal of *Phase 1* is to generate a **standards-compliant DICOM ECG waveform 
 * machine- and acquisition-level metadata from `machine_measurements.csv`
 
 No derived clinical measurements (e.g., RR interval, axes) are embedded in the DICOM at this stage; those are handled separately in the CDM layer.
+
+## Batch Processing with Parallel Execution
+
+For processing large numbers of WFDB files, use `run_convert.py` which provides parallel processing, resume capability, timeout protection, checkpoint writes, and DICOM integrity validation. See the script's docstring for detailed usage instructions.
 
 ---
 
@@ -242,3 +248,14 @@ Example:
   * Signal storage → DICOM Waveform
   * Clinical measurements → OMOP CDM (`Measurement`, `Observation`)
 
+---
+
+## 6. References
+
+### MIMIC-IV-ECG Dataset
+
+Gow, B., Pollard, T., Nathanson, L. A., Johnson, A., Moody, B., Fernandes, C., Greenbaum, N., Waks, J. W., Eslami, P., Carbonati, T., Chaudhari, A., Herbst, E., Moukheiber, D., Berkowitz, S., Mark, R., & Horng, S. (2023). MIMIC-IV-ECG: Diagnostic Electrocardiogram Matched Subset (version 1.0). PhysioNet. RRID:SCR_007345. https://doi.org/10.13026/4nqg-sb35
+
+### PhysioNet Platform
+
+Goldberger, A., Amaral, L., Glass, L., Hausdorff, J., Ivanov, P. C., Mark, R., ... & Stanley, H. E. (2000). PhysioBank, PhysioToolkit, and PhysioNet: Components of a new research resource for complex physiologic signals. Circulation [Online]. 101 (23), pp. e215–e220. RRID:SCR_007345.
